@@ -28,7 +28,10 @@ def load_bad_electrodes(nwb):
     bad_electrodes : ndarray
         Python (0-based) indices of bad electrodes.
     """
-
-    bad_electrodes = nwb.ec_electrodes['bad'].data[:]
+    try:
+        bad_electrodes = nwb.ec_electrodes['bad'].data[:]
+    except:
+        print('Need to include bad electrodes in the saved NWB files?')
+        bad_electrodes = np.array([])
 
     return bad_electrodes
