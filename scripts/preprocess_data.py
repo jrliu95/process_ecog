@@ -4,7 +4,6 @@ import argparse, h5py, time, os
 import numpy as np
 from scipy.io import loadmat
 
-
 from ecog.signal_processing import resample
 from ecog.signal_processing import subtract_CAR
 from ecog.signal_processing import linenoise_notch
@@ -14,10 +13,12 @@ from ecog.utils import load_bad_electrodes, bands
 
 import nwbext_ecog
 from pynwb import NWBHDF5IO
+from pynwb import NWBFile, TimeSeries, NWBHDF5IO
+from pynwb.core import DynamicTable
+from pynwb.misc import DecompositionSeries
 
 
 def main():
-
     parser = argparse.ArgumentParser(description='Preprocessing ecog data.')
     parser.add_argument('path', type=str, help="Path to the data")
     parser.add_argument('subject', type=str, help="Subject code")
@@ -74,8 +75,14 @@ def transform(block_path, suffix=None, phase=False, total_channels=256,
         X = nwb.acquisition['ECoG'].data[:].T * 1e6
         fs = nwb.acquisition['ECoG'].rate
         bad_elects = load_bad_electrodes(nwb)
-    print('Load time for h5 {}: {} seconds'.format(block_name,
-                                                   time.time() - start))
+        session_start_time = nwb.session_start_time
+        ecog_subject = nwb.subject
+        electrode_table = nwb.electrodes
+        electrode_groups = nwb.electrode_groups
+        devices = nwb.devices
+
+    print('Load time for {}: {} seconds'.format(block_name,
+                                                time.time() - start))
     print('rates {}: {} {}'.format(block_name, rate, fs))
     if not np.allclose(rate, fs):
         assert rate < fs
@@ -91,13 +98,13 @@ def transform(block_path, suffix=None, phase=False, total_channels=256,
     start = time.time()
     X = subtract_CAR(X)
     print('CAR subtract time for {}: {} seconds'.format(block_name,
-                                                        time.time()-start))
+                                                        time.time() - start))
 
     # Apply Notch filters
     start = time.time()
     X = linenoise_notch(X, rate)
     print('Notch filter time for {}: {} seconds'.format(block_name,
-                                                        time.time()-start))
+                                                        time.time() - start))
 
     # Apply Hilbert transform and store
     if suffix is None:
@@ -106,39 +113,70 @@ def transform(block_path, suffix=None, phase=False, total_channels=256,
         suffix_str = '_{}'.format(suffix)
     if phase:
         suffix_str = suffix_str + '_random_phase'
-    fname = '{}_AA{}.h5'.format(block_name, suffix_str)
+
+    # Define NWB file path
+    fname = '{}_HilbAA{}.nwb'.format(block_name, suffix_str)
 
     AA_path = os.path.join(block_path, fname)
-    tmp_path = os.path.join(block_path, '{}_tmp.h5'.format(fname))
     X = X.astype('float32')
 
-    with h5py.File(tmp_path, 'w') as f:
-        note = 'applying Hilbert transform'
-        dset = f.create_dataset('X', (len(cfs),
-                                X.shape[0], X.shape[1]),
-                                dtype='float32')
-        theta = None
-        if phase:
-            theta = rng.rand(*X.shape) * 2. * np.pi
-            theta = np.sin(theta) + 1j * np.cos(theta)
-        X_fft_h = None
-        for ii, (cf, sd) in enumerate(zip(cfs, sds)):
-            kernel = gaussian(X, rate, cf, sd)
-            Xp, X_fft_h = hilbert_transform(X, rate, kernel, phase=theta, X_fft_h=X_fft_h)
-            dset[ii] = abs(Xp).astype('float32')
+    # create list of arrays (channel x time) that is the length of the frequency bands
+    dset = []
 
-        dset.dims[0].label = 'filter'
-        dset.dims[1].label = 'channel'
-        dset.dims[2].label = 'time'
-        for val, name in ((cfs, 'filter_center'),
-                          (sds, 'filter_sigma')):
-            if name not in f.keys():
-                f[name] = val
-            dset.dims.create_scale(f[name], name)
-            dset.dims[0].attach_scale(f[name])
+    theta = None
+    if phase:
+        theta = rng.rand(*X.shape) * 2. * np.pi
+        theta = np.sin(theta) + 1j * np.cos(theta)
 
-        f.attrs['sampling_rate'] = rate
-    os.rename(tmp_path, AA_path)
+    X_fft_h = None
+    for ii, (cf, sd) in enumerate(zip(cfs, sds)):
+        kernel = gaussian(X, rate, cf, sd)
+        Xp, X_fft_h = hilbert_transform(X, rate, kernel, phase=theta, X_fft_h=X_fft_h)
+        dset.append(abs(Xp).astype('float32'))
+
+    # stack data to be (bands, channels, times)
+    dset = np.stack(dset, axis=0)
+
+    # change dimensions to work with NWB DecompositionSeries (times, channels, bands)
+    dset = np.transpose(dset, (2, 1, 0))
+
+    # create DynamicTable for labeling the frequency bands
+    bands_table = DynamicTable('Hilbert_AA_bands',
+                               'frequency band mean and stdev for hilbert transform',
+                               id=np.arange(len(cfs)))
+    bands_table.add_column('band_mean',
+                           'frequency band centers',
+                           data=cfs)
+    bands_table.add_column('filter_stdev',
+                           'frequency band stdev',
+                           data=sds)
+
+    # create the DecompositionSeries to store the spectral decomposition
+    ds = DecompositionSeries('Hilbert_AA',
+                             dset,
+                             description='hilbert analytic amplitude',
+                             metric='analytic amplitude',
+                             bands=bands_table,
+                             starting_time=0.0,
+                             rate=rate)
+
+    # Create new NWB file to store spectral decomposition
+    decomp_nwb_file = NWBFile('Hilbert transformed ECoG data',
+                              block_name.split('/')[-1],
+                              session_start_time,
+                              institution='University of California, San Francisco',
+                              lab='Chang Lab')
+                              # electrodes=electrode_table,
+                              # electrode_groups=electrode_groups)
+                              #devices=devices,
+                              #subject=ecog_subject)
+
+    # Add the decomposition information
+    decomp_nwb_file.add_acquisition(ds)
+
+    # Write the finished NWB file
+    with NWBHDF5IO(AA_path, 'w') as f:
+        f.write(decomp_nwb_file)
 
     print('{} finished'.format(block_name))
     print('saved: {}'.format(AA_path))
